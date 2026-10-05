@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Physics Playground</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.2/dist/aframe-physics-system.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-extras@7.7.0/dist/aframe-extras.min.js"></script>
+ 
+ <style>
+    #help {
+      position: fixed; left: 12px; bottom: 12px; z-index: 10;
+      font: 13px/1.5 system-ui, sans-serif; color: #fff;
+      background: rgba(0,0,0,.55); padding: 8px 12px; border-radius: 8px;
+      pointer-events: none; max-width: 340px;
+    }
+  </style>
+</head>
+<body>
+  <div id="help">
+    <b>Desktop:</b> WASD move, drag mouse to look, hold <b>E</b> to grab a box, release to throw.<br>
+    <b>VR:</b> Left stick move · Right stick left/right snap-turn · Push right stick forward to aim, release to teleport · Grip or trigger to grab, release to throw.
+  </div>
+
+  <a-scene
+    renderer="colorManagement: true; antialias: true"
+    physics="driver: local; gravity: -9.8; iterations: 20; friction: 0.7; restitution: 0.1"
+    box-spawner="count: 15"
+    background="color: #1b2430">
+
+    <!-- Lighting & sky -->
+    <a-sky color="#9bb7c9"></a-sky>
+    <a-entity light="type: ambient; intensity: 0.7"></a-entity>
+    <a-entity light="type: directional; intensity: 0.9; castShadow: true" position="-3 8 4"></a-entity>
+
+    <!-- Blue-grey floor: visible plane + invisible static physics slab -->
+    <a-plane position="0 0 0" rotation="-90 0 0" width="40" height="40" color="#607d8b"
+             shadow="receive: true"></a-plane>
+    <a-box static-body position="0 -0.5 0" width="40" height="1" depth="40" visible="false"></a-box>
+
+    <!-- Player rig -->
+    <a-entity id="rig" position="0 0 1.5" player-locomotion>
+      <a-entity id="head" camera look-controls wasd-controls="acceleration: 40" position="0 1.6 0"
+                gaze-grab></a-entity>
+      <a-entity id="lhand" oculus-touch-controls="hand: left"  hand-grab="hand: left"></a-entity>
+      <a-entity id="rhand" oculus-touch-controls="hand: right" hand-grab="hand: right"></a-entity>
+    </a-entity>
+  </a-scene>
+
+  <script>
+    /* ------------------------------------------------------------------
+     * Spawns N green, grabbable, dynamic boxes.
+     * ------------------------------------------------------------------ */
+    AFRAME.registerComponent('box-spawner', {
+      schema: { count: { default: 15 }, size: { default: 0.3 } },
+      init: function () {
+        const make = () => {
+          const { count, size } = this.data;
+          const cols = 5;
+          for (let i = 0; i < count; i++) {
+            const col = i % cols, row = Math.floor(i / cols);
+            const box = document.createElement('a-box');
+            box.setAttribute('width', size);
+            box.setAttribute('height', size);
+            box.setAttribute('depth', size);
+            box.setAttribute('color', '#43a047');
+            box.setAttribute('class', 'grabbable');
+            box.setAttribute('shadow', 'cast: true');
+            box.setAttribute('position', {
+              x: (col - (cols - 1) / 2) * 0.6,
+              y: size / 2 + 0.05,
+              z: -1.5 - row * 0.6
+            });
+            box.setAttribute('dynamic-body', 'mass: 1; linearDamping: 0.1; angularDamping: 0.3');
+            this.el.appendChild(box);
+          }
+        };
+        if (this.el.hasLoaded) make(); else this.el.addEventListener('loaded', make);
+      }
+    });
+
+    /* ------------------------------------------------------------------
+     * Holder: carries a physics body by following a target transform,
+     * then throws it using the tracked velocity on release.
+     * ------------------------------------------------------------------ */
+    const DYNAMIC = 1, KINEMATIC = 4;
+
+    class Holder {
+      constructor(sourceObj, throwBoost) {
+        this.src = sourceObj;           // THREE.Object3D that "holds" the item
+        this.boost = throwBoost || 0;   // extra forward speed on release (desktop)
+        this.held = null;
+        this.mass = 1;
+        this.offset = new THREE.Matrix4();
+        this.tmp = new THREE.Matrix4();
+        this.p = new THREE.Vector3();
+        this.q = new THREE.Quaternion();
+        this.s = new THREE.Vector3();
+        this.prev = new THREE.Vector3();
+        this.vel = new THREE.Vector3();
+        this.raw = new THREE.Vector3();
+        this.hasPrev = false;
+      }
+      grab(el, fixedOffset) {
+        if (this.held || !el.body) return;
+        this.src.updateWorldMatrix(true, false);
+        el.object3D.updateWorldMatrix(true, false);
+        if (fixedOffset) {
+          this.offset.copy(fixedOffset);
+        } else {
+          this.offset.copy(this.src.matrixWorld).invert().multiply(el.object3D.matrixWorld);
+        }
+        const b = el.body;
+        this.mass = b.mass || 1;
+        b.type = KINEMATIC;
+        b.mass = 0;
+        b.updateMassProperties();
+        b.velocity.set(0, 0, 0);
+        b.angularVelocity.set(0, 0, 0);
+        this.held = el;
+        this.hasPrev = false;
+      }
+      update(dtMs) {
+        const dt = Math.max(dtMs, 1) / 1000;
+        this.src.updateWorldMatrix(true, false);
+        this.src.getWorldPosition(this.p);
+        if (this.hasPrev) {
+          this.raw.copy(this.p).sub(this.prev).divideScalar(dt);
+          this.vel.lerp(this.raw, 0.4);
+        }
+        this.prev.copy(this.p);
+        this.hasPrev = true;
+
+        if (!this.held) return;
+        const b = this.held.body;
+        this.tmp.copy(this.src.matrixWorld).multiply(this.offset);
+        this.tmp.decompose(this.p, this.q, this.s);
+        b.position.copy(this.p);
+        b.quaternion.copy(this.q);
+        b.velocity.set(0, 0, 0);
+        b.angularVelocity.set(0, 0, 0);
+      }
+      release() {
+        if (!this.held) return;
+        const el = this.held, b = el.body;
+        this.held = null;
+        b.type = DYNAMIC;
+        b.mass = this.mass;
+        b.updateMassProperties();
+        const v = this.vel.clone();
+        if (this.boost) {
+          const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(
+            this.src.getWorldQuaternion(new THREE.Quaternion()));
+          v.addScaledVector(fwd, this.boost);
+        }
+        if (v.length() > 15) v.setLength(15);
+        b.velocity.set(v.x, v.y, v.z);
+        b.wakeUp();
+      }
+    }
+
+    /* ------------------------------------------------------------------
+     * VR hand grabbing (grip or trigger).
+     * ------------------------------------------------------------------ */
+    AFRAME.registerComponent('hand-grab', {
+      schema: { hand: { default: 'right' }, radius: { default: 0.25 } },
+      init: function () {
+        this.holder = new Holder(this.el.object3D, 0);
+        this.pressed = 0;
+        const down = () => { if (++this.pressed === 1) this.tryGrab(); };
+        const up = () => { this.pressed = Math.max(0, this.pressed - 1); if (!this.pressed) this.holder.release(); };
+        ['gripdown', 'triggerdown'].forEach(e => this.el.addEventListener(e, down));
+        ['gripup', 'triggerup'].forEach(e => this.el.addEventListener(e, up));
+      },
+      tryGrab: function () {
+        const hp = new THREE.Vector3(), bp = new THREE.Vector3();
+        this.el.object3D.getWorldPosition(hp);
+        let best = null, bestD = this.data.radius;
+        document.querySelectorAll('.grabbable').forEach(el => {
+          if (!el.body || this.isHeldElsewhere(el)) return;
+          el.object3D.getWorldPosition(bp);
+          const d = bp.distanceTo(hp);
+          if (d < bestD) { bestD = d; best = el; }
+        });
+        if (best) this.holder.grab(best);
+      },
+      isHeldElsewhere: function (el) {
+        const other = document.querySelectorAll('[hand-grab]');
+        for (const h of other) {
+          const c = h.components['hand-grab'];
+          if (c && c.holder.held === el) return true;
+        }
+        return false;
+      },
+      tick: function (t, dt) { this.holder.update(dt); }
+    });
+
+    /* ------------------------------------------------------------------
+     * Desktop grabbing: hold E while looking at a box.
+     * ------------------------------------------------------------------ */
+    AFRAME.registerComponent('gaze-grab', {
+      schema: { reach: { default: 4 }, hold: { default: 1.4 } },
+      init: function () {
+        this.holder = new Holder(this.el.object3D, 5);
+        this.ray = new THREE.Raycaster();
+        this.keyDown = false;
+        window.addEventListener('keydown', e => {
+          if (e.code !== 'KeyE' || e.repeat || this.keyDown) return;
+          this.keyDown = true;
+          if (!this.el.sceneEl.is('vr-mode')) this.tryGrab();
+        });
+        window.addEventListener('keyup', e => {
+          if (e.code !== 'KeyE') return;
+          this.keyDown = false;
+          this.holder.release();
+        });
+      },
+      tryGrab: function () {
+        const cam = this.el.object3D;
+        const origin = cam.getWorldPosition(new THREE.Vector3());
+        const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.getWorldQuaternion(new THREE.Quaternion()));
+        this.ray.set(origin, dir);
+        this.ray.far = this.data.reach;
+        const els = Array.from(document.querySelectorAll('.grabbable')).filter(e => e.body);
+        const hits = this.ray.intersectObjects(els.map(e => e.object3D), true);
+        if (!hits.length) return;
+        let o = hits[0].object;
+        while (o && !o.el) o = o.parent;
+        if (o && o.el) {
+          const off = new THREE.Matrix4().makeTranslation(0, 0, -this.data.hold);
+          this.holder.grab(o.el, off);
+        }
+      },
+      tick: function (t, dt) { this.holder.update(dt); }
+    });
+
+    /* ------------------------------------------------------------------
+     * XR locomotion: left stick = move, right stick = snap turn,
+     * right stick forward = aim teleport arc, release = teleport.
+     * ------------------------------------------------------------------ */
+    AFRAME.registerComponent('player-locomotion', {
+      schema: {
+        speed: { default: 2.5 },
+        snapAngle: { default: 30 },
+        bounds: { default: 19 },
+        arcSpeed: { default: 7 }
+      },
+      init: function () {
+        this.left = { x: 0, y: 0 };
+        this.right = { x: 0, y: 0 };
+        this.aiming = false;
+        this.target = null;
+        this.snapReady = true;
+
+        const lhand = document.querySelector('#lhand');
+        const rhand = document.querySelector('#rhand');
+        lhand.addEventListener('thumbstickmoved', e => { this.left.x = e.detail.x; this.left.y = e.detail.y; });
+        rhand.addEventListener('thumbstickmoved', e => { this.right.x = e.detail.x; this.right.y = e.detail.y; });
+        this.rhand = rhand;
+
+        // Teleport visuals (added to the scene so they use world coordinates)
+        const scene = this.el.sceneEl.object3D;
+        this.pts = 40;
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.pts * 3), 3));
+        this.arc = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x66ccff }));
+        this.arc.frustumCulled = false;
+        this.arc.visible = false;
+        scene.add(this.arc);
+
+        this.marker = new THREE.Mesh(
+          new THREE.RingGeometry(0.15, 0.25, 32).rotateX(-Math.PI / 2),
+          new THREE.MeshBasicMaterial({ color: 0x66ccff, side: THREE.DoubleSide }));
+        this.marker.visible = false;
+        scene.add(this.marker);
+
+        this.head = document.querySelector('#head');
+      },
+      headWorld: function (out) {
+        return this.head.object3D.getWorldPosition(out);
+      },
+      tick: function (time, dtMs) {
+        if (!this.el.sceneEl.is('vr-mode')) return;
+        const dt = dtMs / 1000;
+        const rig = this.el.object3D;
+        const B = this.data.bounds;
+
+        /* --- Smooth movement (left stick, relative to head yaw) --- */
+        const dead = 0.15;
+        const lx = Math.abs(this.left.x) > dead ? this.left.x : 0;
+        const ly = Math.abs(this.left.y) > dead ? this.left.y : 0;
+        if (lx || ly) {
+          const q = this.head.object3D.getWorldQuaternion(new THREE.Quaternion());
+          const yaw = new THREE.Euler().setFromQuaternion(q, 'YXZ').y;
+          const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+          const rgt = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+          const mv = rgt.multiplyScalar(lx).addScaledVector(fwd, -ly).multiplyScalar(this.data.speed * dt);
+          rig.position.x = THREE.MathUtils.clamp(rig.position.x + mv.x, -B, B);
+          rig.position.z = THREE.MathUtils.clamp(rig.position.z + mv.z, -B, B);
+        }
+
+        /* --- Teleport aiming (right stick pushed forward) --- */
+        const wantAim = this.right.y < -0.6;
+        if (wantAim) {
+          this.aiming = true;
+          this.updateArc();
+        } else if (this.aiming) {
+          this.aiming = false;
+          this.arc.visible = false;
+          this.marker.visible = false;
+          if (this.target) this.teleportTo(this.target);
+          this.target = null;
+        }
+
+        /* --- Snap turn (right stick left/right) --- */
+        if (!this.aiming) {
+          if (Math.abs(this.right.x) > 0.7 && this.snapReady) {
+            this.snapReady = false;
+            this.snapTurn(-Math.sign(this.right.x) * THREE.MathUtils.degToRad(this.data.snapAngle));
+          } else if (Math.abs(this.right.x) < 0.3) {
+            this.snapReady = true;
+          }
+        }
+      },
+      updateArc: function () {
+        const hand = this.rhand.object3D;
+        const origin = hand.getWorldPosition(new THREE.Vector3());
+        const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(hand.getWorldQuaternion(new THREE.Quaternion()));
+        const v = dir.multiplyScalar(this.data.arcSpeed);
+        const g = -9.8, step = 0.04;
+        const pos = this.arc.geometry.attributes.position;
+        const p = origin.clone();
+        let hit = null, n = 0;
+        for (let i = 0; i < this.pts; i++) {
+          pos.setXYZ(i, p.x, p.y, p.z);
+          n = i + 1;
+          const next = p.clone().addScaledVector(v, step);
+          next.y += 0.5 * g * step * step;
+          v.y += g * step;
+          if (next.y <= 0) {
+            const t = p.y / (p.y - next.y || 1e-6);
+            hit = p.clone().lerp(next, THREE.MathUtils.clamp(t, 0, 1));
+            hit.y = 0;
+            pos.setXYZ(i, hit.x, hit.y + 0.01, hit.z);
+            break;
+          }
+          p.copy(next);
+        }
+        // collapse unused vertices onto the last point
+        for (let i = n; i < this.pts; i++) {
+          pos.setXYZ(i, pos.getX(n - 1), pos.getY(n - 1), pos.getZ(n - 1));
+        }
+        pos.needsUpdate = true;
+
+        const B = this.data.bounds;
+        const valid = hit && Math.abs(hit.x) <= B && Math.abs(hit.z) <= B;
+        this.arc.visible = true;
+        this.arc.material.color.set(valid ? 0x66ccff : 0xff6666);
+        if (valid) {
+          this.target = hit;
+          this.marker.position.set(hit.x, 0.02, hit.z);
+          this.marker.visible = true;
+        } else {
+          this.target = null;
+          this.marker.visible = false;
+        }
+      },
+      teleportTo: function (target) {
+        const rig = this.el.object3D;
+        const h = this.headWorld(new THREE.Vector3());
+        rig.position.x += target.x - h.x;
+        rig.position.z += target.z - h.z;
+      },
+      snapTurn: function (angle) {
+        const rig = this.el.object3D;
+        const h = this.headWorld(new THREE.Vector3());
+        const v = new THREE.Vector3(rig.position.x - h.x, 0, rig.position.z - h.z);
+        v.applyAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+        rig.rotation.y += angle;
+        rig.position.x = h.x + v.x;
+        rig.position.z = h.z + v.z;
+      }
+    });
+  </script>
+</body>
+</html>
