@@ -2,13 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>WebXR Physics Playground</title>
+  <title>WebXR Physics Playground 1</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.2/dist/aframe-physics-system.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-extras@7.7.0/dist/aframe-extras.min.js"></script>
- 
- <style>
+
+  <style>
     #help {
       position: fixed; left: 12px; bottom: 12px; z-index: 10;
       font: 13px/1.5 system-ui, sans-serif; color: #fff;
@@ -24,7 +24,7 @@
   </div>
 
   <a-scene
-    renderer="colorManagement: true; antialias: true"
+    renderer="antialias: true"
     physics="driver: local; gravity: -9.8; iterations: 20; friction: 0.7; restitution: 0.1"
     box-spawner="count: 15"
     background="color: #1b2430">
@@ -39,10 +39,18 @@
              shadow="receive: true"></a-plane>
     <a-box static-body position="0 -0.5 0" width="40" height="1" depth="40" visible="false"></a-box>
 
-    <!-- Player rig -->
-    <a-entity id="rig" position="0 0 1.5" player-locomotion>
-      <a-entity id="head" camera look-controls wasd-controls="acceleration: 40" position="0 1.6 0"
-                gaze-grab></a-entity>
+    <!--
+      Player rig.
+      - movement-controls (aframe-extras): WASD on desktop, left thumbstick in VR.
+        speed 0.15 ≈ 2.5 m/s. Right-stick rotation from gamepad-controls is disabled
+        (rotationSensitivity: 0) because player-locomotion handles snap-turning.
+      - player-locomotion (custom): teleport arc, snap turn, play-area bounds.
+    -->
+    <a-entity id="rig" position="0 0 1.5"
+              movement-controls="controls: gamepad, keyboard; speed: 0.15; fly: false"
+              gamepad-controls="rotationSensitivity: 0"
+              player-locomotion>
+      <a-entity id="head" camera look-controls position="0 1.6 0" gaze-grab></a-entity>
       <a-entity id="lhand" oculus-touch-controls="hand: left"  hand-grab="hand: left"></a-entity>
       <a-entity id="rhand" oculus-touch-controls="hand: right" hand-grab="hand: right"></a-entity>
     </a-entity>
@@ -236,26 +244,26 @@
     });
 
     /* ------------------------------------------------------------------
-     * XR locomotion: left stick = move, right stick = snap turn,
-     * right stick forward = aim teleport arc, release = teleport.
+     * XR locomotion extras on top of aframe-extras' movement-controls:
+     *   - right stick forward = aim teleport arc, release = teleport
+     *   - right stick left/right = snap turn
+     *   - keeps the rig inside the play area (desktop and VR)
+     * Smooth movement itself (WASD / left stick) is handled by
+     * movement-controls, so it is not implemented here.
      * ------------------------------------------------------------------ */
     AFRAME.registerComponent('player-locomotion', {
       schema: {
-        speed: { default: 2.5 },
         snapAngle: { default: 30 },
         bounds: { default: 19 },
         arcSpeed: { default: 7 }
       },
       init: function () {
-        this.left = { x: 0, y: 0 };
         this.right = { x: 0, y: 0 };
         this.aiming = false;
         this.target = null;
         this.snapReady = true;
 
-        const lhand = document.querySelector('#lhand');
         const rhand = document.querySelector('#rhand');
-        lhand.addEventListener('thumbstickmoved', e => { this.left.x = e.detail.x; this.left.y = e.detail.y; });
         rhand.addEventListener('thumbstickmoved', e => { this.right.x = e.detail.x; this.right.y = e.detail.y; });
         this.rhand = rhand;
 
@@ -281,24 +289,14 @@
         return this.head.object3D.getWorldPosition(out);
       },
       tick: function (time, dtMs) {
-        if (!this.el.sceneEl.is('vr-mode')) return;
-        const dt = dtMs / 1000;
         const rig = this.el.object3D;
         const B = this.data.bounds;
 
-        /* --- Smooth movement (left stick, relative to head yaw) --- */
-        const dead = 0.15;
-        const lx = Math.abs(this.left.x) > dead ? this.left.x : 0;
-        const ly = Math.abs(this.left.y) > dead ? this.left.y : 0;
-        if (lx || ly) {
-          const q = this.head.object3D.getWorldQuaternion(new THREE.Quaternion());
-          const yaw = new THREE.Euler().setFromQuaternion(q, 'YXZ').y;
-          const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-          const rgt = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
-          const mv = rgt.multiplyScalar(lx).addScaledVector(fwd, -ly).multiplyScalar(this.data.speed * dt);
-          rig.position.x = THREE.MathUtils.clamp(rig.position.x + mv.x, -B, B);
-          rig.position.z = THREE.MathUtils.clamp(rig.position.z + mv.z, -B, B);
-        }
+        // Keep the player inside the floor area (movement-controls has no bounds).
+        rig.position.x = THREE.MathUtils.clamp(rig.position.x, -B, B);
+        rig.position.z = THREE.MathUtils.clamp(rig.position.z, -B, B);
+
+        if (!this.el.sceneEl.is('vr-mode')) return;
 
         /* --- Teleport aiming (right stick pushed forward) --- */
         const wantAim = this.right.y < -0.6;
