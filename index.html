@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>1WebXR Physics</title>
+  <title>1WebXR Physics Playground</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.2/dist/aframe-physics-system.min.js"></script>
@@ -144,6 +144,12 @@
         const b = this.held.body;
         this.tmp.copy(this.src.matrixWorld).multiply(this.offset);
         this.tmp.decompose(this.p, this.q, this.s);
+        // aframe-physics-system treats mass-0 bodies as "driven by the entity":
+        // it copies the entity's transform INTO the body every step. So move the
+        // entity itself (boxes are children of the scene, so local == world)
+        // and mirror it on the body so collisions stay in sync this frame.
+        this.held.object3D.position.copy(this.p);
+        this.held.object3D.quaternion.copy(this.q);
         b.position.copy(this.p);
         b.quaternion.copy(this.q);
         b.velocity.set(0, 0, 0);
@@ -172,7 +178,7 @@
      * VR hand grabbing (grip or trigger).
      * ------------------------------------------------------------------ */
     AFRAME.registerComponent('hand-grab', {
-      schema: { hand: { default: 'right' }, radius: { default: 0.25 } },
+      schema: { hand: { default: 'right' }, radius: { default: 0.3 } },
       init: function () {
         this.holder = new Holder(this.el.object3D, 0);
         this.pressed = 0;
